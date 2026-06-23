@@ -1,0 +1,22 @@
+name: Interactive Debugging Sandbox
+
+on:
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Workaround for GitHub Live Log Streaming Bug
+        run: sleep 10 # Gives you time to load the live logs page before the tunnel command runs
+
+      - name: Open Cloudflare Quick Tunnel for SSH Debugging
+        uses: valeriangalliat/action-sshd-cloudflared@v4
+        # Note: Your GitHub profile SSH keys are used automatically!
+        # If you ever get rate-limited, uncomment the lines below:
+        # env:
+        #   AUTHORIZED_KEYS: "ssh-ed25519 AAAAC3NzaC..."
