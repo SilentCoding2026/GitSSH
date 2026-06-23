@@ -1,0 +1,124 @@
+name: Run Minecraft Server
+on:
+  workflow_dispatch: # Allows you to start the server manually
+
+permissions:
+  contents: write # Required to commit server files and address back to the repo
+
+jobs:
+  minecraft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full jq openjdk-17-jre-headless
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Restore or Initialize Server Directory
+        run: |
+          mkdir -p server
+          # If split 7z archives exist from a previous run, merge and extract them
+          if [ -f server_backup.7z.001 ]; then
+            echo "Found existing server backup. Extracting..."
+            7z x server_backup.7z.001 -oserver/ -y
+            rm -f server_backup.7z.*
+          else
+            echo "No existing backup found. Starting fresh setup."
+          fi
+
+      - name: Download Server Software (If Missing)
+        run: |
+          if [ ! -f server/server.jar ]; then
+            echo "server.jar not found. Downloading from config..."
+            URL=$(jq -r '.server_url' mc_config.json)
+            curl -L -o server/server.jar "$URL"
+          fi
+
+      - name: Configure EULA
+        run: |
+          echo "eula=true" > server/eula.txt
+
+      - name: Download Custom Assets (Mods/Configs)
+        run: |
+          # Iterates over the 'downloads' array inside mc_config.json
+          jq -c '.downloads[]' mc_config.json | while read -r item; do
+            DIR=$(echo "$item" | jq -r '.dir')
+            URL=$(echo "$item" | jq -r '.url')
+            
+            mkdir -p "server/$DIR"
+            FILENAME=$(basename "$URL")
+            
+            echo "Downloading $URL to server/$DIR/"
+            curl -L -o "server/$DIR/$FILENAME" "$URL"
+          done
+
+      - name: Start Cloudflare Tunnel & Expose Port
+        env:
+          # If using a persistent tunnel, add your token to GitHub Secrets
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            echo "Starting temporary Cloudflare Quick Tunnel..."
+            # Launch cloudflared in the background and log output to find the URL
+            cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
+            
+            # Give it a few seconds to initialize and generate a URL
+            sleep 8
+            cat cloudflare.log
+            
+            # Extract the assigned trycloudflare.com address
+            ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
+            if [ -z "$ADDRESS" ]; then
+              # Alternative grep if protocol format differs
+              ADDRESS=$(grep -oE 'tcp://[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | sed 's/tcp:\/\///' | head -n 1)
+            fi
+          else
+            echo "Starting secured named tunnel..."
+            cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
+            ADDRESS="Use your custom configured Cloudflare hostname"
+          fi
+          
+          echo "Server Address: $ADDRESS"
+          echo "$ADDRESS" > address.txt
+
+      - name: Commit and Push Connection Address
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add address.txt
+          git commit -m "chore: update server connection address [skip ci]" || echo "No changes to address"
+          git push
+
+      - name: Run Minecraft Server
+        run: |
+          cd server
+          # Allocates 6GB of RAM to the server out of the ~7GB available on standard runners
+          java -Xmx6G -Xms6G -jar server.jar nogui
+          cd ..
+
+      - name: Compress and Save State on Shutdown
+        if: always() # Ensures backup runs even if the server step is cancelled or crashes
+        run: |
+          echo "Stopping Cloudflare Tunnel..."
+          pkill cloudflared || true
+          
+          echo "Cleaning up old server split archives from repo..."
+          git rm -f server_backup.7z.* || echo "No old archives found to remove"
+          
+          echo "Compressing server directory into ~95MB chunks..."
+          # Compresses the server directory into volumes of 95 Megabytes
+          7z a -v95m server_backup.7z ./server/*
+          
+          echo "Staging new backup chunks..."
+          git add server_backup.7z.*
+          
+          echo "Committing and pushing server state changes..."
+          git commit -m "save: update minecraft server state and world data [skip ci]" || echo "No changes to save"
+          git push origin HEAD:${{ github.ref_name }}
