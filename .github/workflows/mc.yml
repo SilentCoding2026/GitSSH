@@ -1,9 +1,9 @@
 name: Run Minecraft Server
 on:
-  workflow_dispatch: # Allows you to start the server manually
+  workflow_dispatch:
 
 permissions:
-  contents: write # Required to commit server files and address back to the repo
+  contents: write
 
 jobs:
   minecraft:
@@ -21,168 +21,109 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full jq openjdk-25-jre-headless
-          
-          # Install Cloudflared
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          
-          # Install File Browser
           curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
-          
-          # Install Localtunnel via npm
           sudo npm install -g localtunnel
 
       - name: Restore or Initialize Server Directory
         run: |
           mkdir -p server
           if [ -f server_backup.7z.001 ]; then
-            echo "Found existing server backup. Extracting..."
+            echo "Backup found — restoring server"
             7z x server_backup.7z.001 -oserver/ -y
-            rm -f server_backup.7z.*
+            touch server/.restored
           else
-            echo "No existing backup found. Starting fresh setup."
+            echo "No backup — fresh setup"
           fi
 
-      - name: Download Server Software (If Missing)
+      - name: Download Server Software (First Run Only)
         run: |
-          if [ ! -f server/server.jar ]; then
-            echo "server.jar not found. Downloading from config..."
-            URL=$(jq -r '.server_url' mc_config.json)
-            curl -L -o server/server.jar "$URL"
-          fi
-
-      - name: Configure EULA
-        run: |
-          echo "eula=true" > server/eula.txt
-
-      - name: Download Custom Assets (Mods/Configs)
-        run: |
-          jq -c '.downloads[]' mc_config.json | while read -r item; do
-            DIR=$(echo "$item" | jq -r '.dir')
-            URL=$(echo "$item" | jq -r '.url')
-       
-            mkdir -p "server/$DIR"
-            FILENAME=$(basename "${URL%%\?*}")
-       
-            echo "Downloading $URL to server/$DIR/$FILENAME"
-            curl -L "$URL" -o "server/$DIR/$FILENAME"
-          done
-
-      - name: Start Cloudflare Tunnel & Expose Port
-        env:
-          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-        run: |
-          if [ -z "$TUNNEL_TOKEN" ]; then
-            echo "Starting temporary Cloudflare Quick Tunnel..."
-            cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
-            sleep 10
-      
-            echo "===== Cloudflare Tunnel Log ====="
-            cat cloudflare.log
-            echo "================================="
-      
-            ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
-      
-            if [ -z "$ADDRESS" ]; then
-              ADDRESS=$(grep -oE 'tcp://[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log \
-                | sed 's|tcp://||' | head -n 1)
+          if [ ! -f server/.restored ]; then
+            if [ ! -f server/server.jar ]; then
+              URL=$(jq -r '.server_url' mc_config.json)
+              curl -L -o server/server.jar "$URL"
             fi
           else
-            echo "Starting secured named tunnel..."
-            cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > cloudflare.log 2>&1 &
-            sleep 10
-      
-            echo "===== Cloudflare Tunnel Log ====="
-            cat cloudflare.log
-            echo "================================="
-      
-            ADDRESS="Use your configured Cloudflare hostname"
+            echo "Skipping server.jar download (restored)"
           fi
-      
-          echo "Minecraft Server Address: $ADDRESS"
+
+      - name: Configure EULA (First Run Only)
+        run: |
+          if [ ! -f server/.restored ] && [ ! -f server/eula.txt ]; then
+            echo "eula=true" > server/eula.txt
+          else
+            echo "Skipping EULA"
+          fi
+
+      - name: Download Mods / Plugins / Assets (First Run Only)
+        run: |
+          if [ ! -f server/.restored ]; then
+            jq -c '.downloads[]' mc_config.json | while read -r item; do
+              DIR=$(echo "$item" | jq -r '.dir')
+              URL=$(echo "$item" | jq -r '.url')
+              mkdir -p "server/$DIR"
+              FILE=$(basename "${URL%%\?*}")
+              TARGET="server/$DIR/$FILE"
+
+              if [ ! -f "$TARGET" ]; then
+                curl -L "$URL" -o "$TARGET"
+              fi
+            done
+          else
+            echo "Skipping downloads (server restored)"
+          fi
+
+      - name: Start Cloudflare Tunnel & Expose Port
+        run: |
+          cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
+          sleep 10
+          cat cloudflare.log
+          ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
           echo "Minecraft Address: $ADDRESS" > address.txt
 
       - name: Start File Browser & Localtunnel
         run: |
-          echo "Starting File Browser on port 8080..."
-          filebrowser --root ./server --port 8080 --address 0.0.0.0 --noauth > filebrowser.log 2>&1 &
-          
-          echo "Starting Localtunnel for File Browser..."
-          lt --port 8080 > localtunnel.log 2>&1 &
-          
+          filebrowser --root ./server --port 8080 --address 0.0.0.0 --noauth > fb.log 2>&1 &
+          lt --port 8080 > lt.log 2>&1 &
           sleep 5
-          cat localtunnel.log
-          
-          FB_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.loca\.lt' localtunnel.log | head -n 1)
-          echo "File Browser Web URL: $FB_URL"
-          echo "File Browser Web URL: $FB_URL" >> address.txt
+          cat lt.log
+          URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.loca\.lt' lt.log | head -n 1)
+          echo "File Browser: $URL" >> address.txt
 
-      - name: Commit and Push Connection Addresses
+      - name: Commit Addresses
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add address.txt
-          git commit -m "chore: update connection addresses [skip ci]" || echo "No changes to address"
+          git commit -m "update addresses [skip ci]" || true
           git push
 
-      - name: Run Minecraft Server (With Auto-Restart)
+      - name: Run Minecraft Server
         run: |
           cd server
-          
-          # Remove any old flags leftover from previous workflow runs
           rm -f stop.flag
-          
-          # Setup clean shutdown if user cancels the GitHub Action manually
-          stop_server() {
-            echo "GitHub workflow cancellation detected! Stopping Minecraft server safely..."
-            touch stop.flag
-            if [ -n "$JAVA_PID" ]; then
-              kill -SIGINT $JAVA_PID
-              wait $JAVA_PID
-            fi
-          }
-          trap stop_server SIGINT SIGTERM
 
-          # Auto-restart loop
+          trap "touch stop.flag; kill \$JAVA_PID" SIGINT SIGTERM
+
           while true; do
-            echo "Starting Minecraft Server..."
             java -Xmx6G -Xms6G -jar server.jar nogui &
             JAVA_PID=$!
-            
-            # Wait for the server process to stop
             wait $JAVA_PID
-            
-            # Check if we should shut down the entire workflow or restart
-            if [ -f stop.flag ]; then
-              echo "stop.flag detected. Exiting loop and stopping workflow."
-              break
-            else
-              echo "Server stopped without stop.flag. Restarting in 5 seconds..."
-              echo "To permanently stop the server, create a file named 'stop.flag' via File Browser, or stop the GitHub action."
-              sleep 5
-            fi
+            [ -f stop.flag ] && break
+            sleep 5
           done
-          cd ..
 
-      - name: Compress and Save State on Shutdown
+      - name: Save Server State
         if: always()
         run: |
-          echo "Stopping Tunnels and File Browser..."
           pkill cloudflared || true
           pkill lt || true
           pkill filebrowser || true
-          
-          echo "Cleaning up old server split archives from repo..."
-          git rm -f server_backup.7z.* || echo "No old archives found to remove"
-          
           pkill -f java || true
-          pkill -f openjdk || true
-          sleep 5
-          7z a server_backup.7z server -v95m -xr!server/plugins/spark/tmp/*
-          
-          echo "Staging new backup chunks..."
+
+          git rm -f server_backup.7z.* || true
+          7z a server_backup.7z server -v95m
           git add server_backup.7z.*
-          
-          echo "Committing and pushing server state changes..."
-          git commit -m "save: update minecraft server state and world data [skip ci]" || echo "No changes to save"
-          git push origin HEAD:${{ github.ref_name }}
+          git commit -m "save server state [skip ci]" || true
+          git push
