@@ -49,16 +49,15 @@ jobs:
 
       - name: Download Custom Assets (Mods/Configs)
         run: |
-          # Iterates over the 'downloads' array inside mc_config.json
           jq -c '.downloads[]' mc_config.json | while read -r item; do
             DIR=$(echo "$item" | jq -r '.dir')
             URL=$(echo "$item" | jq -r '.url')
-            
+      
             mkdir -p "server/$DIR"
-            FILENAME=$(basename "$URL")
-            
-            echo "Downloading $URL to server/$DIR/"
-            curl -L -o "server/$DIR/$FILENAME" "$URL"
+            FILENAME=$(basename "${URL%%\?*}")
+      
+            echo "Downloading $URL to server/$DIR/$FILENAME"
+            curl -L "$URL" -o "server/$DIR/$FILENAME"
           done
 
       - name: Start Cloudflare Tunnel & Expose Port
