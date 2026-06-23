@@ -99,8 +99,24 @@ jobs:
       - name: Run Minecraft Server
         run: |
           cd server
+          
+          # Trap standard cancellation signals (SIGINT/SIGTERM) to handle clean shutdown
+          stop_server() {
+            echo "Cancellation detected! Stopping Minecraft server safely..."
+            # Send stop command to the java process if it's still running
+            if [ -n "$JAVA_PID" ]; then
+              kill -SIGINT $JAVA_PID
+              wait $JAVA_PID
+            fi
+          }
+          trap stop_server SIGINT SIGTERM
+
           # Allocates 6GB of RAM to the server out of the ~7GB available on standard runners
-          java -Xmx6G -Xms6G -jar server.jar nogui
+          java -Xmx6G -Xms6G -jar server.jar nogui &
+          JAVA_PID=$!
+          
+          # Wait for the background Java process to finish
+          wait $JAVA_PID
           cd ..
 
       - name: Compress and Save State on Shutdown
