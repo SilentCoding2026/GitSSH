@@ -13,6 +13,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
       - name: Remove Java
         run: sudo apt-get remove -y --ignore-missing 'java*' 'openj*' || true
 
@@ -20,13 +21,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full jq openjdk-25-jre-headless
+          
+          # Install Cloudflared
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
+          
+          # Install File Browser
+          curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
+          
+          # Install Localtunnel via npm
+          sudo npm install -g localtunnel
 
       - name: Restore or Initialize Server Directory
         run: |
           mkdir -p server
-          # If split 7z archives exist from a previous run, merge and extract them
           if [ -f server_backup.7z.001 ]; then
             echo "Found existing server backup. Extracting..."
             7z x server_backup.7z.001 -oserver/ -y
@@ -52,32 +60,25 @@ jobs:
           jq -c '.downloads[]' mc_config.json | while read -r item; do
             DIR=$(echo "$item" | jq -r '.dir')
             URL=$(echo "$item" | jq -r '.url')
-      
+       
             mkdir -p "server/$DIR"
             FILENAME=$(basename "${URL%%\?*}")
-      
+       
             echo "Downloading $URL to server/$DIR/$FILENAME"
             curl -L "$URL" -o "server/$DIR/$FILENAME"
           done
 
       - name: Start Cloudflare Tunnel & Expose Port
         env:
-          # If using a persistent tunnel, add your token to GitHub Secrets
           TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           if [ -z "$TUNNEL_TOKEN" ]; then
             echo "Starting temporary Cloudflare Quick Tunnel..."
-            # Launch cloudflared in the background and log output to find the URL
             cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
-            
-            # Give it a few seconds to initialize and generate a URL
             sleep 8
             cat cloudflare.log
-            
-            # Extract the assigned trycloudflare.com address
             ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
             if [ -z "$ADDRESS" ]; then
-              # Alternative grep if protocol format differs
               ADDRESS=$(grep -oE 'tcp://[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | sed 's/tcp:\/\///' | head -n 1)
             fi
           else
@@ -86,25 +87,43 @@ jobs:
             ADDRESS="Use your custom configured Cloudflare hostname"
           fi
           
-          echo "Server Address: $ADDRESS"
-          echo "$ADDRESS" > address.txt
+          echo "Minecraft Server Address: $ADDRESS"
+          echo "Minecraft Address: $ADDRESS" > address.txt
 
-      - name: Commit and Push Connection Address
+      - name: Start File Browser & Localtunnel
+        run: |
+          echo "Starting File Browser on port 8080..."
+          filebrowser --root ./server --port 8080 --address 0.0.0.0 --noauth > filebrowser.log 2>&1 &
+          
+          echo "Starting Localtunnel for File Browser..."
+          lt --port 8080 > localtunnel.log 2>&1 &
+          
+          sleep 5
+          cat localtunnel.log
+          
+          FB_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.loca\.lt' localtunnel.log | head -n 1)
+          echo "File Browser Web URL: $FB_URL"
+          echo "File Browser Web URL: $FB_URL" >> address.txt
+
+      - name: Commit and Push Connection Addresses
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add address.txt
-          git commit -m "chore: update server connection address [skip ci]" || echo "No changes to address"
+          git commit -m "chore: update connection addresses [skip ci]" || echo "No changes to address"
           git push
 
-      - name: Run Minecraft Server
+      - name: Run Minecraft Server (With Auto-Restart)
         run: |
           cd server
           
-          # Trap standard cancellation signals (SIGINT/SIGTERM) to handle clean shutdown
+          # Remove any old flags leftover from previous workflow runs
+          rm -f stop.flag
+          
+          # Setup clean shutdown if user cancels the GitHub Action manually
           stop_server() {
-            echo "Cancellation detected! Stopping Minecraft server safely..."
-            # Send stop command to the java process if it's still running
+            echo "GitHub workflow cancellation detected! Stopping Minecraft server safely..."
+            touch stop.flag
             if [ -n "$JAVA_PID" ]; then
               kill -SIGINT $JAVA_PID
               wait $JAVA_PID
@@ -112,19 +131,34 @@ jobs:
           }
           trap stop_server SIGINT SIGTERM
 
-          # Allocates 6GB of RAM to the server out of the ~7GB available on standard runners
-          java -Xmx6G -Xms6G -jar server.jar nogui &
-          JAVA_PID=$!
-          
-          # Wait for the background Java process to finish
-          wait $JAVA_PID
+          # Auto-restart loop
+          while true; do
+            echo "Starting Minecraft Server..."
+            java -Xmx6G -Xms6G -jar server.jar nogui &
+            JAVA_PID=$!
+            
+            # Wait for the server process to stop
+            wait $JAVA_PID
+            
+            # Check if we should shut down the entire workflow or restart
+            if [ -f stop.flag ]; then
+              echo "stop.flag detected. Exiting loop and stopping workflow."
+              break
+            else
+              echo "Server stopped without stop.flag. Restarting in 5 seconds..."
+              echo "To permanently stop the server, create a file named 'stop.flag' via File Browser, or stop the GitHub action."
+              sleep 5
+            fi
+          done
           cd ..
 
       - name: Compress and Save State on Shutdown
-        if: always() # Ensures backup runs even if the server step is cancelled or crashes
+        if: always()
         run: |
-          echo "Stopping Cloudflare Tunnel..."
+          echo "Stopping Tunnels and File Browser..."
           pkill cloudflared || true
+          pkill lt || true
+          pkill filebrowser || true
           
           echo "Cleaning up old server split archives from repo..."
           git rm -f server_backup.7z.* || echo "No old archives found to remove"
