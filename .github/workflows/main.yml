@@ -1,0 +1,132 @@
+name: Run Minecraft Server Fixed
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  minecraft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Remove Java
+        run: sudo apt-get remove -y --ignore-missing 'java*' 'openj*' || true
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full jq openjdk-25-jre-headless
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
+          sudo npm install -g localtunnel
+
+      - name: Restore or Initialize Server Directory
+        run: |
+          mkdir -p server
+          if [ -f server_backup.7z.001 ]; then
+            echo "Found existing server backup. Extracting..."
+            7z x server_backup.7z.001 -oserver/ -y
+          else
+            echo "No existing backup found. Fresh server."
+          fi
+
+      - name: Download Server Software (If Missing)
+        run: |
+          if [ ! -f server/server.jar ]; then
+            URL=$(jq -r '.server_url' mc_config.json)
+            curl -L -o server/server.jar "$URL"
+          fi
+
+      - name: Configure EULA
+        run: |
+          if [ ! -f server/eula.txt ]; then
+            echo "eula=true" > server/eula.txt
+          fi
+
+      - name: Download Custom Assets (Mods/Configs)
+        run: |
+          if [ ! -f server/.initialized ]; then
+            jq -c '.downloads[]' mc_config.json | while read -r item; do
+              DIR=$(echo "$item" | jq -r '.dir')
+              URL=$(echo "$item" | jq -r '.url')
+              mkdir -p "server/$DIR"
+              FILENAME=$(basename "${URL%%\?*}")
+              TARGET="server/$DIR/$FILENAME"
+
+              if [ ! -f "$TARGET" ]; then
+                curl -L "$URL" -o "$TARGET"
+              fi
+            done
+            touch server/.initialized
+          else
+            echo "Server already initialized. Skipping downloads."
+          fi
+
+      - name: Start Cloudflare Tunnel & Expose Port
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          if [ -z "$TUNNEL_TOKEN" ]; then
+            cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
+            sleep 8
+            ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
+          else
+            cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
+            ADDRESS="Configured Cloudflare Tunnel"
+          fi
+          echo "Minecraft Address: $ADDRESS" > address.txt
+
+      - name: Start File Browser & Localtunnel
+        run: |
+          filebrowser --root ./server --port 8080 --address 0.0.0.0 --noauth > filebrowser.log 2>&1 &
+          lt --port 8080 > localtunnel.log 2>&1 &
+          sleep 5
+          FB_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.loca\.lt' localtunnel.log | head -n 1)
+          echo "File Browser: $FB_URL" >> address.txt
+
+      - name: Commit and Push Connection Addresses
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add address.txt
+          git commit -m "chore: update connection addresses [skip ci]" || true
+          git push
+
+      - name: Run Minecraft Server (With Auto-Restart)
+        run: |
+          cd server
+          rm -f stop.flag
+
+          stop_server() {
+            touch stop.flag
+            kill -SIGINT $JAVA_PID || true
+          }
+          trap stop_server SIGINT SIGTERM
+
+          while true; do
+            java -Xmx6G -Xms6G -jar server.jar nogui &
+            JAVA_PID=$!
+            wait $JAVA_PID
+            [ -f stop.flag ] && break
+            sleep 5
+          done
+
+      - name: Compress and Save State on Shutdown
+        if: always()
+        run: |
+          pkill cloudflared || true
+          pkill lt || true
+          pkill filebrowser || true
+          pkill -f java || true
+
+          git rm -f server_backup.7z.* || true
+          7z a server_backup.7z server -v95m -xr!server/plugins/spark/tmp/*
+          git add server_backup.7z.*
+          git commit -m "save: minecraft server state [skip ci]" || true
+          git push origin HEAD:${{ github.ref_name }}
