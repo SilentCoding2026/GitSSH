@@ -75,18 +75,30 @@ jobs:
           if [ -z "$TUNNEL_TOKEN" ]; then
             echo "Starting temporary Cloudflare Quick Tunnel..."
             cloudflared tunnel --url tcp://localhost:25565 > cloudflare.log 2>&1 &
-            sleep 8
+            sleep 10
+      
+            echo "===== Cloudflare Tunnel Log ====="
             cat cloudflare.log
+            echo "================================="
+      
             ADDRESS=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | head -n 1)
+      
             if [ -z "$ADDRESS" ]; then
-              ADDRESS=$(grep -oE 'tcp://[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log | sed 's/tcp:\/\///' | head -n 1)
+              ADDRESS=$(grep -oE 'tcp://[a-zA-Z0-9-]+\.trycloudflare\.com:[0-9]+' cloudflare.log \
+                | sed 's|tcp://||' | head -n 1)
             fi
           else
             echo "Starting secured named tunnel..."
-            cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" &
-            ADDRESS="Use your custom configured Cloudflare hostname"
+            cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > cloudflare.log 2>&1 &
+            sleep 10
+      
+            echo "===== Cloudflare Tunnel Log ====="
+            cat cloudflare.log
+            echo "================================="
+      
+            ADDRESS="Use your configured Cloudflare hostname"
           fi
-          
+      
           echo "Minecraft Server Address: $ADDRESS"
           echo "Minecraft Address: $ADDRESS" > address.txt
 
