@@ -129,9 +129,10 @@ jobs:
           echo "Cleaning up old server split archives from repo..."
           git rm -f server_backup.7z.* || echo "No old archives found to remove"
           
-          echo "Compressing server directory into ~95MB chunks..."
-          # Compresses the server directory into volumes of 95 Megabytes
-          7z a -v95m server_backup.7z ./server/*
+          pkill -f java || true
+          pkill -f openjdk || true
+          sleep 5
+          7z a server_backup.7z server -v95m -xr!server/plugins/spark/tmp/*
           
           echo "Staging new backup chunks..."
           git add server_backup.7z.*
